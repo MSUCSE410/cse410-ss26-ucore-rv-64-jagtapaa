@@ -4,16 +4,26 @@
 #include "syscall_ids.h"
 #include "timer.h"
 #include "trap.h"
+#include "vm.h"
+#define MAX_SYSCALL_NUM 500
 
-uint64 sys_write(int fd, char *str, uint len)
+uint64 sys_getpid();
+uint64 sys_mmap(uint64 start, uint64 len, int prot);
+uint64 sys_munmap(uint64 start, uint64 len);
+
+uint64 sys_write(int fd, uint64 va, uint len)
 {
-	debugf("sys_write fd = %d str = %x, len = %d", fd, str, len);
+	debugf("sys_write fd = %d va = %x, len = %d", fd, va, len);
 	if (fd != STDOUT)
 		return -1;
-	for (int i = 0; i < len; ++i) {
+	struct proc *p = curr_proc();
+	char str[MAX_STR_LEN];
+	int size = copyinstr(p->pagetable, str, va, MIN(len, MAX_STR_LEN));
+	debugf("size = %d", size);
+	for (int i = 0; i < size; ++i) {
 		console_putchar(str[i]);
 	}
-	return len;
+	return size;
 }
 
 __attribute__((noreturn)) void sys_exit(int code)
@@ -27,39 +37,145 @@ uint64 sys_sched_yield()
 	yield();
 	return 0;
 }
-
+// asks kernel what time it is
 uint64 sys_gettimeofday(TimeVal *val, int _tz)
 {
+	struct proc *p = curr_proc();
+	uint64 pa = useraddr(p->pagetable, (uint64)val);
+	if (pa == 0)
+		return -1;
+
+	TimeVal *tv = (TimeVal *)pa;
 	uint64 cycle = get_cycle();
-	val->sec = cycle / CPU_FREQ;
-	val->usec = (cycle % CPU_FREQ) * 1000000 / CPU_FREQ;
+	tv->sec = cycle / CPU_FREQ;
+	tv->usec = (cycle % CPU_FREQ) * 1000000 / CPU_FREQ;
 	return 0;
 }
 
+// TODO: add support for mmap and munmap syscall.
+// hint: read through docstrings in vm.c. Watching CH4 video may also help.
+// Note the return value and PTE flags (especially U,X,W,R)
 /*
 * LAB1: you may need to define sys_task_info here
 */
 uint64 sys_task_info(TaskInfo *ti)
 {
-	if (ti == 0)
+	struct proc *p = curr_proc();
+	uint64 pa = useraddr(p->pagetable, (uint64)ti);
+	if (pa == 0)
 		return -1;
 
-	struct proc *p = curr_proc();
+	TaskInfo *info = (TaskInfo *)pa;
 
-	ti->status = Running;
+	info->status = Running;
 
 	for (int i = 0; i < MAX_SYSCALL_NUM; i++) {
-		ti->syscall_times[i] = p->syscall_times[i];
+		info->syscall_times[i] = p->syscall_times[i];
 	}
 
 	uint64 now = get_cycle();
-	ti->time = (now - p->start_cycle) * 1000 / CPU_FREQ;
+	info->time = (now - p->start_cycle) * 1000 / CPU_FREQ;
 
 	return 0;
 }
 
-
 extern char trap_page[];
+
+uint64 sys_getpid()
+{
+	return curr_proc()->pid;
+}
+
+// allocates memory in virtual address space
+// start: the user virtual address where mapping begins
+// len: how many bytes the user wants mapped
+// prot: permissions memory should have
+uint64 sys_mmap(uint64 start, uint64 len, int prot)
+{
+	if (start % PGSIZE != 0)
+		return -1;
+	if (len == 0)
+		return -1;
+	if (start >= MAXVA)
+		return -1;
+	if (start + len < start)
+		return -1;
+	if (start + len > MAXVA)
+		return -1;
+	if ((prot & ~0x7) != 0)
+		return -1;
+
+	int perm = 0;
+	if (prot & 0x1)
+		perm |= PTE_R; // read
+	if (prot & 0x2)
+		perm |= PTE_W; // write
+	if (prot & 0x4)
+		perm |= PTE_X; // execute
+
+	if (perm == 0)
+		return -1;
+
+	struct proc *p = curr_proc();
+	uint64 npages = (len + PGSIZE - 1) / PGSIZE;
+
+	for (uint64 i = 0; i < npages; i++) {
+		uint64 va = start + i * PGSIZE;
+
+		if (walkaddr(p->pagetable, va) != 0)
+			return -1;
+
+		void *pa = kalloc();
+		if (pa == 0)
+			return -1;
+
+		memset(pa, 0, PGSIZE);
+
+		if (mappages(p->pagetable, va, PGSIZE, (uint64)pa,
+			     perm | PTE_U) < 0) {
+			kfree(pa);
+			return -1;
+		}
+	}
+
+	// converts byte length into number of pages
+	uint64 end_page = (start + len + PGSIZE - 1) / PGSIZE;
+	if (end_page > p->max_page)
+		p->max_page = end_page;
+
+	return 0;
+}
+
+// unallocates memory 
+// start: where mapped region begins
+// len: how much to remove
+uint64 sys_munmap(uint64 start, uint64 len)
+{
+	if (start % PGSIZE != 0)
+		return -1;
+	if (len == 0)
+		return -1;
+	if (start >= MAXVA)
+		return -1;
+	if (start + len < start)
+		return -1;
+	if (start + len > MAXVA)
+		return -1;
+
+	struct proc *p = curr_proc();
+	uint64 npages = (len + PGSIZE - 1) / PGSIZE;
+
+	for (uint64 i = 0; i < npages; i++) {
+		uint64 va = start + i * PGSIZE;
+		// checks whether page is mapped so that it prevents unmapped memory that doesn't exist
+		if (walkaddr(p->pagetable, va) == 0)
+			return -1;
+	}
+	
+	// removes page table entries for that address range
+	uvmunmap(p->pagetable, start, npages, 1);
+	return 0;
+}
 
 void syscall()
 {
@@ -75,10 +191,9 @@ void syscall()
 	if (id >= 0 && id < MAX_SYSCALL_NUM) {
 		curr_proc()->syscall_times[id]++;
 	}
-
 	switch (id) {
 	case SYS_write:
-		ret = sys_write(args[0], (char *)args[1], args[2]);
+		ret = sys_write(args[0], args[1], args[2]);
 		break;
 	case SYS_exit:
 		sys_exit(args[0]);
@@ -92,16 +207,18 @@ void syscall()
 	/*
 	* LAB1: you may need to add SYS_taskinfo case here
 	*/
-	#define SYS_task_info 410
-
-	#define SYS_pidfd_send_signal 424
-	#define SYS_io_uring_setup 425
-	#define SYS_io_uring_enter 426
-	#define SYS_io_uring_register 427
-
 	case SYS_task_info:
-	ret = sys_task_info((TaskInfo *)args[0]);
-	break;
+		ret = sys_task_info((TaskInfo *)args[0]);
+		break;
+	case SYS_getpid:
+		ret = sys_getpid();
+		break;
+	case SYS_mmap:
+		ret = sys_mmap(args[0], args[1], args[2]);
+		break;
+	case SYS_munmap:
+		ret = sys_munmap(args[0], args[1]);
+		break;
 
 	default:
 		ret = -1;
