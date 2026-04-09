@@ -4,6 +4,7 @@
 #include "riscv.h"
 #include "types.h"
 #include "queue.h"
+#define BIG_STRIDE (1u << 30)
 
 #define NPROC (512)
 #define FD_BUFFER_SIZE (16)
@@ -45,6 +46,10 @@ struct proc {
 	struct proc *parent; // Parent process
 	uint64 exit_code;
 	struct file *files[FD_BUFFER_SIZE];
+	// stride scheduling fields
+    uint64 stride; // stride: accumulated "istance this process has traveled, starts at 0 and increases
+    uint64 pass; // process priority, default 16, minimum 2, higher number = scheduled more often
+    int priority;
 };
 
 int cpuid();
@@ -60,6 +65,7 @@ int wait(int, int *);
 void add_task(struct proc *);
 struct proc *pop_task();
 struct proc *allocproc();
+void freeproc(struct proc *);
 int fdalloc(struct file *);
 // swtch.S
 void swtch(struct context *, struct context *);
